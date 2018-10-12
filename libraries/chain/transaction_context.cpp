@@ -7,20 +7,105 @@
 #include <eosio/chain/transaction_object.hpp>
 #include <eosio/chain/global_property_object.hpp>
 
+#pragma push_macro("N")
+#undef N
+#include <boost/accumulators/accumulators.hpp>
+#include <boost/accumulators/statistics/stats.hpp>
+#include <boost/accumulators/statistics/mean.hpp>
+#include <boost/accumulators/statistics/min.hpp>
+#include <boost/accumulators/statistics/max.hpp>
+#include <boost/accumulators/statistics/variance.hpp>
+#pragma pop_macro("N")
+
+#include <chrono>
+
 namespace eosio { namespace chain {
+
+namespace bacc = boost::accumulators;
+
+   struct deadline_timer_verify {
+      deadline_timer_verify() {
+         int test_intervals[] = {50000, 10000, 5000, 1000, 500, 100, 50, 10};
+
+         struct sigaction act;
+         sigemptyset(&act.sa_mask);
+         act.sa_handler = timer_hit;
+         act.sa_flags = 0;
+         if(sigaction(SIGALRM, &act, NULL))
+            return;
+
+         sigset_t alrm;
+         sigemptyset(&alrm);
+         sigaddset(&alrm, SIGALRM);
+         int dummy;
+
+         for(int& interval : test_intervals) {
+            unsigned int loops = test_intervals[0]/interval;
+
+            for(unsigned int i = 0; i < loops; ++i) {
+               struct itimerval enable = {{0, 0}, {0, interval}};
+               hit = 0;
+               auto start = std::chrono::high_resolution_clock::now();
+	       unsigned long long t0 = __builtin_readcyclecounter();
+               if(setitimer(ITIMER_REAL, &enable, NULL))
+                  return;
+               while(!hit) {}
+	       unsigned long long t1 = __builtin_readcyclecounter();
+	       unsigned long long cycles_to_do_something = t1 - t0; // assuming no overflow
+               auto end = std::chrono::high_resolution_clock::now();
+               int timer_slop = std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() - interval;
+	       printf("target:%i got:%i slop:%i o:%llu\n", interval,std::chrono::duration_cast<std::chrono::microseconds>(end-start).count()  , timer_slop, cycles_to_do_something) ;
+               samples(timer_slop);
+            }
+         }
+         use_deadline_timer = bacc::max(samples) < 15;
+
+         act.sa_handler = SIG_DFL;
+         sigaction(SIGALRM, &act, NULL);
+      }
+
+      static void timer_hit(int) {
+         hit = 1;
+      }
+      static volatile sig_atomic_t hit;
+
+      bacc::accumulator_set<int, bacc::stats<bacc::tag::mean, bacc::tag::min, bacc::tag::max, bacc::tag::variance>> samples;
+      bool use_deadline_timer = false;
+   };
+   volatile sig_atomic_t deadline_timer_verify::hit;
+   static deadline_timer_verify deadline_timer_verification;
 
    deadline_timer::deadline_timer() {
       if(initialized)
          return;
-      struct sigaction act;
-      act.sa_handler = timer_expired;
-      sigemptyset(&act.sa_mask);
-      act.sa_flags = 0;
-      sigaction(SIGALRM, &act, NULL);
       initialized = true;
+
+      #define TIMER_STATS_FORMAT "min:${min}us max:${max}us mean:${mean}us stddev:${stddev}us"
+      #define TIMER_STATS \
+         ("min", bacc::min(deadline_timer_verification.samples))("max", bacc::max(deadline_timer_verification.samples)) \
+         ("mean", (int)bacc::mean(deadline_timer_verification.samples))("stddev", (int)sqrt(bacc::variance(deadline_timer_verification.samples)))
+      ilog("3 stddv: ${p}", ("p", sqrt(bacc::variance(deadline_timer_verification.samples))*3));
+
+      if(deadline_timer_verification.use_deadline_timer) {
+         struct sigaction act;
+         act.sa_handler = timer_expired;
+         sigemptyset(&act.sa_mask);
+         act.sa_flags = 0;
+         if(sigaction(SIGALRM, &act, NULL) == 0) {
+            ilog("Using deadline timer for checktime: " TIMER_STATS_FORMAT, TIMER_STATS);;
+            return;
+         }
+      }
+
+      wlog("Using polled checktime; deadline timer too inaccurate: " TIMER_STATS_FORMAT, TIMER_STATS);
+      deadline_timer_verification.use_deadline_timer = false; //set in case sigaction() fails above
    }
 
    void deadline_timer::start(fc::time_point tp) {
+      if(!deadline_timer_verification.use_deadline_timer) {
+         expired = 1;
+         return;
+      }
       microseconds x = tp.time_since_epoch() - fc::time_point::now().time_since_epoch();
       if(x.count() < 18)
          expired = 1;
@@ -32,6 +117,8 @@ namespace eosio { namespace chain {
    }
 
    void deadline_timer::stop() {
+      if(!deadline_timer_verification.use_deadline_timer)
+         return;
       struct itimerval disable = {{0, 0}, {0, 0}};
       setitimer(ITIMER_REAL, &disable, NULL);
    }
